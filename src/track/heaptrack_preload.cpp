@@ -134,7 +134,7 @@ void init()
             __libc_freeres();
         }
     });
-    heaptrack_init(getenv("DUMP_HEAPTRACK_OUTPUT"),
+    heaptrack_init(getenv("DUMP_HEAPTRACK_OUTPUT"), getenv("HEAPTRACK_THREAD_FILTER"),
                    [] {
                        hooks::calloc.original = &dummy_calloc;
                        hooks::calloc.init();

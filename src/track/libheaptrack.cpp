@@ -66,7 +66,7 @@ enum DebugVerbosity
 };
 
 // change this to add more debug output to stderr
-constexpr const DebugVerbosity s_debugVerbosity = NoDebugOutput;
+constexpr const DebugVerbosity s_debugVerbosity = MinimalOutput;
 
 /**
  * Call this to optionally show debug information but give the compiler
@@ -118,6 +118,27 @@ struct RecursionGuard
 };
 
 thread_local bool RecursionGuard::isActive = false;
+
+char s_thread_filter[64] = {0,};
+void setThreadNameFilter(const char* filter)
+{
+    strncpy(s_thread_filter, filter, 63);
+}
+
+bool isThisThreadEnabled(){
+    static thread_local int enabled = -1;
+    if(enabled == -1) {
+        if(s_thread_filter[0] == 0){
+            enabled = 1;
+        } else {
+            char name[32] = {0,};
+            pthread_getname_np(pthread_self(), name, 32);
+            enabled = (strstr(s_thread_filter, name) != nullptr) ? 1 : 0;
+        }
+    }
+    return enabled;
+}
+
 
 void writeVersion(FILE* out)
 {
@@ -194,6 +215,8 @@ FILE* createFile(const char* fileName)
     return out;
 }
 
+//thread_local Trace trace;
+
 /**
  * Thread-Safe heaptrack API
  *
@@ -220,7 +243,7 @@ public:
         s_locked.store(false, memory_order_release);
     }
 
-    void initialize(const char* fileName, heaptrack_callback_t initBeforeCallback,
+    void initialize(const char* fileName, const char* threadNameFilter, heaptrack_callback_t initBeforeCallback,
                     heaptrack_callback_initialized_t initAfterCallback, heaptrack_callback_t stopCallback)
     {
         debugLog<MinimalOutput>("initializing: %s", fileName);
@@ -272,6 +295,7 @@ public:
             return;
         }
 
+        setThreadNameFilter(threadNameFilter);
         writeVersion(out);
         writeExe(out);
         writeCommandLine(out);
@@ -601,7 +625,7 @@ HeapTrack::LockedData* HeapTrack::s_data{nullptr};
 }
 extern "C" {
 
-void heaptrack_init(const char* outputFileName, heaptrack_callback_t initBeforeCallback,
+void heaptrack_init(const char* outputFileName, const char* threadNameFiler, heaptrack_callback_t initBeforeCallback,
                     heaptrack_callback_initialized_t initAfterCallback, heaptrack_callback_t stopCallback)
 {
     RecursionGuard guard;
@@ -609,7 +633,7 @@ void heaptrack_init(const char* outputFileName, heaptrack_callback_t initBeforeC
     debugLog<MinimalOutput>("heaptrack_init(%s)", outputFileName);
 
     HeapTrack heaptrack(guard);
-    heaptrack.initialize(outputFileName, initBeforeCallback, initAfterCallback, stopCallback);
+    heaptrack.initialize(outputFileName, threadNameFiler, initBeforeCallback, initAfterCallback, stopCallback);
 }
 
 void heaptrack_stop()
@@ -627,9 +651,10 @@ void heaptrack_stop()
     heaptrack.shutdown();
 }
 
+
 void heaptrack_malloc(void* ptr, size_t size)
 {
-    if (ptr && !RecursionGuard::isActive) {
+    if (ptr && !RecursionGuard::isActive && isThisThreadEnabled()) {
         RecursionGuard guard;
 
         debugLog<VeryVerboseOutput>("heaptrack_malloc(%p, %zu)", ptr, size);
@@ -656,14 +681,13 @@ void heaptrack_free(void* ptr)
 
 void heaptrack_realloc(void* ptr_in, size_t size, void* ptr_out)
 {
-    if (ptr_out && !RecursionGuard::isActive) {
+    if (ptr_out && !RecursionGuard::isActive && isThisThreadEnabled()) {
         RecursionGuard guard;
 
         debugLog<VeryVerboseOutput>("heaptrack_realloc(%p, %zu, %p)", ptr_in, size, ptr_out);
 
         Trace trace;
         trace.fill(2 + HEAPTRACK_DEBUG_BUILD);
-
         HeapTrack heaptrack(guard);
         if (ptr_in) {
             heaptrack.handleFree(ptr_in);
