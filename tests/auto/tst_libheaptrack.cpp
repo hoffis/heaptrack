@@ -40,7 +40,7 @@ TEST_CASE ("api") {
     TempFile tmp; // opened/closed by heaptrack_init
 
     SECTION ("init") {
-        heaptrack_init(tmp.fileName.c_str(),
+        heaptrack_init(tmp.fileName.c_str(), "",
                        []() {
                            REQUIRE(!initBeforeCalled);
                            REQUIRE(!initAfterCalled);
