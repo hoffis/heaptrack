@@ -65,6 +65,7 @@ Both parts require the following tools and libraries:
 - cmake 2.8.9 or higher
 - a C\+\+11 enabled compiler like g\+\+ or clang\+\+
 - zlib
+- optionally: zstd for faster (de)compression
 - libdl
 - pthread
 - libc
@@ -196,3 +197,16 @@ As a FOSS project, we welcome contributions of any form. You can help improve th
 When submitting bug reports, you can anonymize your data with the `tools/anonymize` script:
 
     tools/anonymize heaptrack.APP.PID.gz heaptrack.bug_report_data.gz
+
+## Known bugs and limitations
+
+### Issues with old gold linker
+
+Libunwind may produce bogus backtraces when unwinding from code linked with old versions of the gold linker.
+In such cases, recording with heaptrack seems to work and produces data files. But parsing these data files
+with heaptrack_gui will often lead to out-of-memory crashes. Looking at the data with heaptrack_print, one
+will see garbage backtraces that are completely broken.
+
+If you encounter such issues, try to relink your application and also libunwind with `ld.bfd` instead of `ld.gold`.
+You can see if you are affected by running the libunwind unit tests via `make check`. But do note that you
+need to relink your application too, not only libunwind.

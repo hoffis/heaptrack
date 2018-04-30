@@ -28,9 +28,11 @@
 #include <cstdlib>
 #include <fcntl.h>
 #include <link.h>
-#include <stdio_ext.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdio_ext.h>
+#include <sys/file.h>
+#include <syscall.h>
 
 #include <atomic>
 #include <cinttypes>
@@ -45,6 +47,7 @@
 #include "tracetree.h"
 #include "util/config.h"
 #include "util/libunwind_config.h"
+#include "util/linewriter.h"
 
 /**
  * uncomment this to get extended debug code for known pointers
@@ -57,44 +60,22 @@ using namespace std;
 
 namespace {
 
-enum DebugVerbosity
+using clock = chrono::steady_clock;
+chrono::time_point<clock> startTime()
 {
-    NoDebugOutput,
-    MinimalOutput,
-    VerboseOutput,
-    VeryVerboseOutput,
-};
-
-// change this to add more debug output to stderr
-constexpr const DebugVerbosity s_debugVerbosity = MinimalOutput;
-
-/**
- * Call this to optionally show debug information but give the compiler
- * a hand in removing it all if debug output is disabled.
- */
-template <DebugVerbosity debugLevel, typename... Args>
-inline void debugLog(const char fmt[], Args... args)
-{
-    if (debugLevel <= s_debugVerbosity) {
-        flockfile(stderr);
-        fprintf(stderr, "heaptrack debug [%d]: ", static_cast<int>(debugLevel));
-        fprintf(stderr, fmt, args...);
-        fputc('\n', stderr);
-        funlockfile(stderr);
-    }
+    static const chrono::time_point<clock> s_start = clock::now();
+    return s_start;
 }
 
-/**
- * Set to true in an atexit handler. In such conditions, the stop callback
- * will not be called.
- */
-atomic<bool> s_atexit{false};
+chrono::milliseconds elapsedTime()
+{
+    return chrono::duration_cast<chrono::milliseconds>(clock::now() - startTime());
+}
 
-/**
- * Set to true in heaptrack_stop, when s_atexit was not yet set. In such conditions,
- * we always fully unload and cleanup behind ourselves
- */
-atomic<bool> s_forceCleanup{false};
+__pid_t gettid()
+{
+    return syscall(SYS_gettid);
+}
 
 /**
  * A per-thread handle guard to prevent infinite recursion, which should be
@@ -139,48 +120,81 @@ bool isThisThreadEnabled(){
     return enabled;
 }
 
-
-void writeVersion(FILE* out)
+enum DebugVerbosity
 {
-    fprintf(out, "v %x %x\n", HEAPTRACK_VERSION, HEAPTRACK_FILE_FORMAT_VERSION);
-}
+    NoDebugOutput,
+    MinimalOutput,
+    VerboseOutput,
+    VeryVerboseOutput,
+};
 
-void writeExe(FILE* out)
+// change this to add more debug output to stderr
+constexpr const DebugVerbosity s_debugVerbosity = NoDebugOutput;
+
+/**
+ * Call this to optionally show debug information but give the compiler
+ * a hand in removing it all if debug output is disabled.
+ */
+template <DebugVerbosity debugLevel, typename... Args>
+inline void debugLog(const char fmt[], Args... args)
 {
-    const int BUF_SIZE = 1023;
-    char buf[BUF_SIZE + 1];
-    ssize_t size = readlink("/proc/self/exe", buf, BUF_SIZE);
-    if (size > 0 && size < BUF_SIZE) {
-        buf[size] = 0;
-        fprintf(out, "x %s\n", buf);
+    if (debugLevel <= s_debugVerbosity) {
+        RecursionGuard guard;
+        flockfile(stderr);
+        fprintf(stderr, "heaptrack debug(%d) [%d:%d]@%lu ", static_cast<int>(debugLevel), getpid(), gettid(),
+                elapsedTime().count());
+        fprintf(stderr, fmt, args...);
+        fputc('\n', stderr);
+        funlockfile(stderr);
     }
 }
 
-void writeCommandLine(FILE* out)
+void printBacktrace()
 {
-    fputc('X', out);
-    const int BUF_SIZE = 4096;
-    char buf[BUF_SIZE + 1];
-    auto fd = open("/proc/self/cmdline", O_RDONLY);
-    int bytesRead = read(fd, buf, BUF_SIZE);
-    char* end = buf + bytesRead;
-    for (char* p = buf; p < end;) {
-        fputc(' ', out);
-        fputs(p, out);
-        while (*p++)
-            ; // skip until start of next 0-terminated section
+    if (s_debugVerbosity == NoDebugOutput)
+        return;
+
+#if LIBUNWIND_HAS_UNW_GETCONTEXT && LIBUNWIND_HAS_UNW_INIT_LOCAL
+    RecursionGuard guard;
+
+    unw_context_t context;
+    unw_getcontext(&context);
+
+    unw_cursor_t cursor;
+    unw_init_local(&cursor, &context);
+
+    int frameNr = 0;
+    while (unw_step(&cursor)) {
+        ++frameNr;
+        unw_word_t ip = 0;
+        unw_get_reg(&cursor, UNW_REG_IP, &ip);
+
+        unw_word_t sp = 0;
+        unw_get_reg(&cursor, UNW_REG_SP, &sp);
+
+        char symbol[256] = {"<unknown>"};
+        unw_word_t offset = 0;
+        unw_get_proc_name(&cursor, symbol, sizeof(symbol), &offset);
+
+        fprintf(stderr, "#%-2d 0x%016" PRIxPTR " sp=0x%016" PRIxPTR " %s + 0x%" PRIxPTR "\n", frameNr,
+                static_cast<uintptr_t>(ip), static_cast<uintptr_t>(sp), symbol, static_cast<uintptr_t>(offset));
     }
-
-    close(fd);
-    fputc('\n', out);
+#endif
 }
 
-void writeSystemInfo(FILE* out)
-{
-    fprintf(out, "I %lx %lx\n", sysconf(_SC_PAGESIZE), sysconf(_SC_PHYS_PAGES));
-}
+/**
+ * Set to true in an atexit handler. In such conditions, the stop callback
+ * will not be called.
+ */
+atomic<bool> s_atexit{false};
 
-FILE* createFile(const char* fileName)
+/**
+ * Set to true in heaptrack_stop, when s_atexit was not yet set. In such conditions,
+ * we always fully unload and cleanup behind ourselves
+ */
+atomic<bool> s_forceCleanup{false};
+
+int createFile(const char* fileName)
 {
     string outputFileName;
     if (fileName) {
@@ -189,10 +203,10 @@ FILE* createFile(const char* fileName)
 
     if (outputFileName == "-" || outputFileName == "stdout") {
         debugLog<VerboseOutput>("%s", "will write to stdout");
-        return stdout;
+        return fileno(stdout);
     } else if (outputFileName == "stderr") {
         debugLog<VerboseOutput>("%s", "will write to stderr");
-        return stderr;
+        return fileno(stderr);
     }
 
     if (outputFileName.empty()) {
@@ -202,14 +216,17 @@ FILE* createFile(const char* fileName)
 
     boost::replace_all(outputFileName, "$$", to_string(getpid()));
 
-    auto out = fopen(outputFileName.c_str(), "w");
+    auto out = open(outputFileName.c_str(), O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
     debugLog<VerboseOutput>("will write to %s/%p\n", outputFileName.c_str(), out);
     // we do our own locking, this speeds up the writing significantly
-    if (out) {
-        __fsetlocking(out, FSETLOCKING_BYCALLER);
-    } else {
-        fprintf(stderr, "ERROR: failed to open heaptrack output file %s: %s (%d)\n",
-                outputFileName.c_str(), strerror(errno), errno);
+    if (out == -1) {
+        fprintf(stderr, "ERROR: failed to open heaptrack output file %s: %s (%d)\n", outputFileName.c_str(),
+                strerror(errno), errno);
+    } else if (flock(out, LOCK_EX | LOCK_NB) != 0) {
+        fprintf(stderr, "ERROR: failed to lock heaptrack output file %s: %s (%d)\n", outputFileName.c_str(),
+                strerror(errno), errno);
+        close(out);
+        return -1;
     }
 
     return out;
@@ -223,24 +240,21 @@ FILE* createFile(const char* fileName)
  * The only critical section in libheaptrack is the output of the data,
  * dl_iterate_phdr
  * calls, as well as initialization and shutdown.
- *
- * This uses a spinlock, instead of a std::mutex, as the latter can lead to
- * deadlocks
- * on destruction. The spinlock is "simple", and OK to only guard the small
- * sections.
  */
 class HeapTrack
 {
 public:
     HeapTrack(const RecursionGuard& /*recursionGuard*/)
-        : HeapTrack([] { return true; })
     {
+        debugLog<VeryVerboseOutput>("%s", "acquiring lock");
+        s_lock.lock();
+        debugLog<VeryVerboseOutput>("%s", "lock acquired");
     }
 
     ~HeapTrack()
     {
         debugLog<VeryVerboseOutput>("%s", "releasing lock");
-        s_locked.store(false, memory_order_release);
+        s_lock.unlock();
     }
 
     void initialize(const char* fileName, const char* threadNameFilter, heaptrack_callback_t initBeforeCallback,
@@ -286,9 +300,9 @@ public:
             });
         });
 
-        FILE* out = createFile(fileName);
+        const auto out = createFile(fileName);
 
-        if (!out) {
+        if (out == -1) {
             if (stopCallback) {
                 stopCallback();
             }
@@ -296,16 +310,16 @@ public:
         }
 
         setThreadNameFilter(threadNameFilter);
-        writeVersion(out);
-        writeExe(out);
-        writeCommandLine(out);
-        writeSystemInfo(out);
-
         s_data = new LockedData(out, stopCallback);
+
+        writeVersion();
+        writeExe();
+        writeCommandLine();
+        writeSystemInfo();
 
         if (initAfterCallback) {
             debugLog<MinimalOutput>("%s", "calling initAfterCallback");
-            initAfterCallback(out);
+            initAfterCallback(s_data->out);
             debugLog<MinimalOutput>("%s", "calling initAfterCallback done");
         }
 
@@ -322,6 +336,9 @@ public:
 
         writeTimestamp();
         writeRSS();
+
+        s_data->out.flush();
+        s_data->out.close();
 
         // NOTE: we leak heaptrack data on exit, intentionally
         // This way, we can be sure to get all static deallocations.
@@ -343,23 +360,20 @@ public:
 
     void writeTimestamp()
     {
-        if (!s_data || !s_data->out) {
+        if (!s_data || !s_data->out.canWrite()) {
             return;
         }
 
-        auto elapsed = chrono::duration_cast<chrono::milliseconds>(clock::now() - s_data->start);
+        auto elapsed = elapsedTime();
 
         debugLog<VeryVerboseOutput>("writeTimestamp(%" PRIx64 ")", elapsed.count());
 
-        if (fprintf(s_data->out, "c %" PRIx64 "\n", elapsed.count()) < 0) {
-            writeError();
-            return;
-        }
+        s_data->out.writeHexLine('c', static_cast<size_t>(elapsed.count()));
     }
 
     void writeRSS()
     {
-        if (!s_data || !s_data->out || !s_data->procStatm) {
+        if (!s_data || !s_data->out.canWrite() || !s_data->procStatm) {
             return;
         }
 
@@ -376,19 +390,59 @@ public:
         // TODO: use custom allocators with known page sizes to prevent tainting
         //       the RSS numbers with heaptrack-internal data
 
-        if (fprintf(s_data->out, "R %zx\n", rss) < 0) {
-            writeError();
-            return;
+        s_data->out.writeHexLine('R', rss);
+    }
+
+    void writeVersion()
+    {
+        s_data->out.writeHexLine('v', static_cast<size_t>(HEAPTRACK_VERSION),
+                                 static_cast<size_t>(HEAPTRACK_FILE_FORMAT_VERSION));
+    }
+
+    void writeExe()
+    {
+        const int BUF_SIZE = 1023;
+        char buf[BUF_SIZE + 1];
+        ssize_t size = readlink("/proc/self/exe", buf, BUF_SIZE);
+        if (size > 0 && size < BUF_SIZE) {
+            buf[size] = 0;
+            s_data->out.write("x %s\n", buf);
         }
+    }
+
+    void writeCommandLine()
+    {
+        s_data->out.write("X");
+        const int BUF_SIZE = 4096;
+        char buf[BUF_SIZE + 1];
+        auto fd = open("/proc/self/cmdline", O_RDONLY);
+        int bytesRead = read(fd, buf, BUF_SIZE);
+        char* end = buf + bytesRead;
+        for (char* p = buf; p < end;) {
+            s_data->out.write(" %s", p);
+            while (*p++)
+                ; // skip until start of next 0-terminated section
+        }
+
+        close(fd);
+        s_data->out.write("\n");
+    }
+
+    void writeSystemInfo()
+    {
+        s_data->out.writeHexLine('I', static_cast<size_t>(sysconf(_SC_PAGESIZE)),
+                                 static_cast<size_t>(sysconf(_SC_PHYS_PAGES)));
     }
 
     void handleMalloc(void* ptr, size_t size, const Trace& trace)
     {
-        if (!s_data || !s_data->out) {
+        if (!s_data || !s_data->out.canWrite()) {
             return;
         }
         updateModuleCache();
-        const auto index = s_data->traceTree.index(trace, s_data->out);
+
+        const auto index = s_data->traceTree.index(
+            trace, [this](uintptr_t ip, uint32_t index) { return s_data->out.writeHexLine('t', ip, index); });
 
 #ifdef DEBUG_MALLOC_PTRS
         auto it = s_data->known.find(ptr);
@@ -396,15 +450,12 @@ public:
         s_data->known.insert(ptr);
 #endif
 
-        if (fprintf(s_data->out, "+ %zx %x %" PRIxPTR "\n", size, index, reinterpret_cast<uintptr_t>(ptr)) < 0) {
-            writeError();
-            return;
-        }
+        s_data->out.writeHexLine('+', size, index, reinterpret_cast<uintptr_t>(ptr));
     }
 
     void handleFree(void* ptr)
     {
-        if (!s_data || !s_data->out) {
+        if (!s_data || !s_data->out.canWrite()) {
             return;
         }
 
@@ -414,10 +465,7 @@ public:
         s_data->known.erase(it);
 #endif
 
-        if (fprintf(s_data->out, "- %" PRIxPTR "\n", reinterpret_cast<uintptr_t>(ptr)) < 0) {
-            writeError();
-            return;
-        }
+        s_data->out.writeHexLine('-', reinterpret_cast<uintptr_t>(ptr));
     }
 
 private:
@@ -431,23 +479,20 @@ private:
 
         debugLog<VerboseOutput>("dlopen_notify_callback: %s %zx", fileName, info->dlpi_addr);
 
-        if (fprintf(heaptrack->s_data->out, "m %s %zx", fileName, info->dlpi_addr) < 0) {
-            heaptrack->writeError();
+        if (!heaptrack->s_data->out.write("m %s %zx", fileName, info->dlpi_addr)) {
             return 1;
         }
 
         for (int i = 0; i < info->dlpi_phnum; i++) {
             const auto& phdr = info->dlpi_phdr[i];
             if (phdr.p_type == PT_LOAD) {
-                if (fprintf(heaptrack->s_data->out, " %zx %zx", phdr.p_vaddr, phdr.p_memsz) < 0) {
-                    heaptrack->writeError();
+                if (!heaptrack->s_data->out.write(" %zx %zx", phdr.p_vaddr, phdr.p_memsz)) {
                     return 1;
                 }
             }
         }
 
-        if (fputc('\n', heaptrack->s_data->out) == EOF) {
-            heaptrack->writeError();
+        if (!heaptrack->s_data->out.write("\n")) {
             return 1;
         }
 
@@ -479,12 +524,11 @@ private:
 
     void updateModuleCache()
     {
-        if (!s_data || !s_data->out || !s_data->moduleCacheDirty) {
+        if (!s_data || !s_data->out.canWrite() || !s_data->moduleCacheDirty) {
             return;
         }
         debugLog<MinimalOutput>("%s", "updateModuleCache()");
-        if (fputs("m -\n", s_data->out) == EOF) {
-            writeError();
+        if (!s_data->out.write("m -\n")) {
             return;
         }
         dl_iterate_phdr(&dl_iterate_phdr_callback, this);
@@ -494,32 +538,43 @@ private:
     void writeError()
     {
         debugLog<MinimalOutput>("write error %d/%s", errno, strerror(errno));
-        s_data->out = nullptr;
+        printBacktrace();
         shutdown();
     }
 
+    struct LockCheckFailed{};
+
+    /**
+     * To prevent deadlocks on shutdown, we try to lock from the timer thread
+     * and throw an LockCheckFailed exception otherwise.
+     */
     template <typename AdditionalLockCheck>
     HeapTrack(AdditionalLockCheck lockCheck)
     {
-        debugLog<VeryVerboseOutput>("%s", "acquiring lock");
-        while (s_locked.exchange(true, memory_order_acquire) && lockCheck()) {
+        debugLog<VeryVerboseOutput>("%s", "trying to acquire lock");
+        while (!s_lock.try_lock()) {
+            if (!lockCheck())
+                throw LockCheckFailed();
             this_thread::sleep_for(chrono::microseconds(1));
         }
         debugLog<VeryVerboseOutput>("%s", "lock acquired");
     }
 
-    using clock = chrono::steady_clock;
-
     struct LockedData
     {
-        LockedData(FILE* out, heaptrack_callback_t stopCallback)
+        LockedData(int out, heaptrack_callback_t stopCallback)
             : out(out)
             , stopCallback(stopCallback)
         {
+
             debugLog<MinimalOutput>("%s", "constructing LockedData");
             procStatm = fopen("/proc/self/statm", "r");
             if (!procStatm) {
-                fprintf(stderr, "WARNING: Failed to open /proc/self/statm for reading.\n");
+                fprintf(stderr, "WARNING: Failed to open /proc/self/statm for reading: %s.\n", strerror(errno));
+            } else if (setvbuf(procStatm, nullptr, _IONBF, 0)) {
+                // disable buffering to ensure we read the latest values
+                fprintf(stderr, "WARNING: Failed to disable buffering for reading of /proc/self/statm: %s.\n",
+                        strerror(errno));
             }
 
             // ensure this utility thread is not handling any signals
@@ -545,10 +600,12 @@ private:
                     // TODO: make interval customizable
                     this_thread::sleep_for(chrono::milliseconds(10));
 
-                    HeapTrack heaptrack([&] { return !stopTimerThread.load(); });
-                    if (!stopTimerThread) {
+                    try {
+                        HeapTrack heaptrack([&] { return !stopTimerThread.load(); });
                         heaptrack.writeTimestamp();
                         heaptrack.writeRSS();
+                    } catch (LockCheckFailed) {
+                        break;
                     }
                 }
             });
@@ -570,9 +627,7 @@ private:
                 }
             }
 
-            if (out) {
-                fclose(out);
-            }
+            out.close();
 
             if (procStatm) {
                 fclose(procStatm);
@@ -584,12 +639,7 @@ private:
             debugLog<MinimalOutput>("%s", "done destroying LockedData");
         }
 
-        /**
-         * Note: We use the C stdio API here for performance reasons.
-         *       Esp. in multi-threaded environments this is much faster
-         *       to produce non-per-line-interleaved output.
-         */
-        FILE* out = nullptr;
+        LineWriter out;
 
         /// /proc/self/statm file stream to read RSS value from
         FILE* procStatm = nullptr;
@@ -605,7 +655,6 @@ private:
 
         TraceTree traceTree;
 
-        const chrono::time_point<clock> start = clock::now();
         atomic<bool> stopTimerThread{false};
         thread timerThread;
 
@@ -616,11 +665,11 @@ private:
 #endif
     };
 
-    static atomic<bool> s_locked;
+    static std::mutex s_lock;
     static LockedData* s_data;
 };
 
-atomic<bool> HeapTrack::s_locked{false};
+std::mutex HeapTrack::s_lock;
 HeapTrack::LockedData* HeapTrack::s_data{nullptr};
 }
 extern "C" {
@@ -629,6 +678,8 @@ void heaptrack_init(const char* outputFileName, const char* threadNameFiler, hea
                     heaptrack_callback_initialized_t initAfterCallback, heaptrack_callback_t stopCallback)
 {
     RecursionGuard guard;
+    // initialize
+    startTime();
 
     debugLog<MinimalOutput>("heaptrack_init(%s)", outputFileName);
 

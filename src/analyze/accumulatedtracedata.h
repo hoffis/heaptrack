@@ -41,14 +41,12 @@ struct Frame
 
     bool operator==(const Frame& rhs) const
     {
-        return std::tie(functionIndex, fileIndex, line)
-            == std::tie(rhs.functionIndex, rhs.fileIndex, rhs.line);
+        return std::tie(functionIndex, fileIndex, line) == std::tie(rhs.functionIndex, rhs.fileIndex, rhs.line);
     }
 
     bool operator<(const Frame& rhs) const
     {
-        return std::tie(functionIndex, fileIndex, line)
-             < std::tie(rhs.functionIndex, rhs.fileIndex, rhs.line);
+        return std::tie(functionIndex, fileIndex, line) < std::tie(rhs.functionIndex, rhs.fileIndex, rhs.line);
     }
 };
 
@@ -61,14 +59,12 @@ struct InstructionPointer
 
     bool compareWithoutAddress(const InstructionPointer& other) const
     {
-        return std::tie(moduleIndex, frame)
-             < std::tie(other.moduleIndex, other.frame);
+        return std::tie(moduleIndex, frame) < std::tie(other.moduleIndex, other.frame);
     }
 
     bool equalWithoutAddress(const InstructionPointer& other) const
     {
-        return std::tie(moduleIndex, frame)
-            == std::tie(other.moduleIndex, other.frame);
+        return std::tie(moduleIndex, frame) == std::tie(other.moduleIndex, other.frame);
     }
 };
 
@@ -90,10 +86,11 @@ struct Allocation : public AllocationData
 struct AllocationInfo
 {
     uint64_t size = 0;
-    TraceIndex traceIndex;
+    // index into AccumulatedTraceData::allocations
+    AllocationIndex allocationIndex;
     bool operator==(const AllocationInfo& rhs) const
     {
-        return rhs.traceIndex == traceIndex && rhs.size == size;
+        return rhs.allocationIndex == allocationIndex && rhs.size == size;
     }
 };
 
@@ -103,7 +100,7 @@ struct AccumulatedTraceData
     virtual ~AccumulatedTraceData() = default;
 
     virtual void handleTimeStamp(int64_t oldStamp, int64_t newStamp) = 0;
-    virtual void handleAllocation(const AllocationInfo& info, const AllocationIndex index) = 0;
+    virtual void handleAllocation(const AllocationInfo& info, const AllocationInfoIndex index) = 0;
     virtual void handleDebuggee(const char* command) = 0;
 
     const std::string& stringify(const StringIndex stringId) const;
@@ -111,9 +108,13 @@ struct AccumulatedTraceData
     std::string prettyFunction(const std::string& function) const;
 
     bool read(const std::string& inputFile);
-    enum ParsePass {
+    enum ParsePass
+    {
+        // find time of total peak cost
         FirstPass,
+        // parse individual allocations
         SecondPass,
+        // GUI only: graph-building
         ThirdPass
     };
     bool read(const std::string& inputFile, const ParsePass pass);
@@ -141,7 +142,15 @@ struct AccumulatedTraceData
     // occur with an index larger than any other we encountered so far
     // this can be used to our advantage in speeding up the findAllocation calls.
     TraceIndex m_maxAllocationTraceIndex;
+    // we don't want to shuffle allocations around, so instead keep a secondary
+    // vector around for efficient index lookup
+    std::vector<std::pair<TraceIndex, AllocationIndex>> traceIndexToAllocationIndex;
 
+    /// find and return the index into the @c allocations vector for the given trace index.
+    /// if the trace index wasn't mapped before, an empty Allocation will be added
+    /// and its index returned.
+    AllocationIndex mapToAllocationIndex(const TraceIndex traceIndex);
+    /// map the trace index to an allocation and return a reference to it
     Allocation& findAllocation(const TraceIndex traceIndex);
 
     InstructionPointer findIp(const IpIndex ipIndex) const;

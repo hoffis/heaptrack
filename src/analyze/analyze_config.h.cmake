@@ -1,5 +1,5 @@
 /*
- * Copyright 2014-2017 Milian Wolff <mail@milianw.de>
+ * Copyright 2018 Milian Wolff <mail@milianw.de>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -16,33 +16,10 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
-void foo()
-{
-    new char[1];
-}
+#ifndef HEAPTRACK_ANALYZE_CONFIG_H
+#define HEAPTRACK_ANALYZE_CONFIG_H
 
-void bar()
-{
-    foo();
-    new char[2];
-}
+#cmakedefine01 ZSTD_FOUND
 
-void asdf()
-{
-    bar();
-    new char[3];
-}
+#endif // HEAPTRACK_ANALYZE_CONFIG_H
 
-void foobar()
-{
-    asdf();
-    new char[5];
-}
-
-int main()
-{
-    asdf();
-    new char[4];
-    foobar();
-    return 0;
-}

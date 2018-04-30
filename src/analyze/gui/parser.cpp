@@ -48,16 +48,7 @@ struct StringCache
 
     QString file(const Frame& frame) const
     {
-        if (frame.fileIndex) {
-            return stringify(frame.fileIndex);
-        } else {
-            return {};
-        }
-    }
-
-    QString module(const InstructionPointer& ip) const
-    {
-        return stringify(ip.moduleIndex);
+        return stringify(frame.fileIndex);
     }
 
     QString stringify(const StringIndex index) const
@@ -251,7 +242,7 @@ struct ParserData final : public AccumulatedTraceData
         temporaryChartData.rows << temporary;
     }
 
-    void handleAllocation(const AllocationInfo& info, const AllocationIndex index)
+    void handleAllocation(const AllocationInfo& info, const AllocationInfoIndex index)
     {
         maxConsumedSinceLastTimeStamp = max(maxConsumedSinceLastTimeStamp, totalCost.leaked);
 
@@ -306,6 +297,7 @@ struct ParserData final : public AccumulatedTraceData
 
 void setParents(QVector<RowData>& children, const RowData* parent)
 {
+    children.squeeze();
     for (auto& row : children) {
         row.parent = parent;
         setParents(row.children, &row);
@@ -328,6 +320,8 @@ TreeData mergeAllocations(const ParserData& data)
     for (const auto& allocation : data.allocations) {
         auto traceIndex = allocation.traceIndex;
         auto rows = &topRows;
+        unordered_set<uint32_t> recursionGuard;
+        recursionGuard.insert(traceIndex.index);
         while (traceIndex) {
             const auto& trace = data.findTrace(traceIndex);
             const auto& ip = data.findIp(trace.ipIndex);
@@ -341,6 +335,10 @@ TreeData mergeAllocations(const ParserData& data)
                 break;
             }
             traceIndex = trace.parentIndex;
+            if (!recursionGuard.insert(traceIndex.index).second) {
+                qWarning() << "Trace recursion detected - corrupt data file?";
+                break;
+            }
         }
     }
     // now set the parents, the data is constant from here on
@@ -419,7 +417,8 @@ AllocationData buildCallerCallee(const TreeData& bottomUpData, CallerCalleeRows*
             while (node) {
                 const auto& location = node->location;
                 if (!recursionGuard.contains(location)) { // aggregate caller-callee data
-                    auto it = lower_bound(callerCalleeData->begin(), callerCalleeData->end(), location,
+                    auto it = lower_bound(
+                        callerCalleeData->begin(), callerCalleeData->end(), location,
                         [](const CallerCalleeData& lhs, const LocationData::Ptr& rhs) { return lhs.location < rhs; });
                     if (it == callerCalleeData->end() || it->location != location) {
                         it = callerCalleeData->insert(it, {{}, {}, location});
@@ -513,7 +512,8 @@ HistogramData buildSizeHistogram(ParserData& data)
         } else {
             row.columns[0].allocations += info.allocations;
         }
-        const auto ipIndex = data.findTrace(info.info.traceIndex).ipIndex;
+        const auto& allocation = data.allocations[info.info.allocationIndex.index];
+        const auto ipIndex = data.findTrace(allocation.traceIndex).ipIndex;
         const auto ip = data.findIp(ipIndex);
         const auto location = data.stringCache.location(ipIndex, ip);
         auto it = lower_bound(columnData.begin(), columnData.end(), location);

@@ -38,13 +38,17 @@
 #include "libbacktrace/backtrace.h"
 #include "libbacktrace/internal.h"
 #include "util/linereader.h"
+#include "util/linewriter.h"
 #include "util/pointermap.h"
 
+#include <signal.h>
 #include <unistd.h>
 
 using namespace std;
 
 namespace {
+
+#define error_out cerr << __FILE__ << ':' << __LINE__ << " ERROR:"
 
 string demangle(const char* function)
 {
@@ -70,7 +74,8 @@ struct Frame
         : function(function)
         , file(file)
         , line(line)
-    {}
+    {
+    }
 
     bool isValid() const
     {
@@ -94,7 +99,8 @@ struct ResolvedFrame
         : functionIndex(functionIndex)
         , fileIndex(fileIndex)
         , line(line)
-    {}
+    {
+    }
     size_t functionIndex;
     size_t fileIndex;
     int line;
@@ -109,8 +115,10 @@ struct ResolvedIP
 
 struct Module
 {
-    Module(uintptr_t addressStart, uintptr_t addressEnd, backtrace_state* backtraceState, size_t moduleIndex)
-        : addressStart(addressStart)
+    Module(string fileName, uintptr_t addressStart, uintptr_t addressEnd, backtrace_state* backtraceState,
+           size_t moduleIndex)
+        : fileName(fileName)
+        , addressStart(addressStart)
         , addressEnd(addressEnd)
         , moduleIndex(moduleIndex)
         , backtraceState(backtraceState)
@@ -130,9 +138,9 @@ struct Module
                              Frame frame(demangle(function), file ? file : "", line);
                              auto info = reinterpret_cast<AddressInformation*>(data);
                              if (!info->frame.isValid()) {
-                                info->frame = frame;
+                                 info->frame = frame;
                              } else {
-                                info->inlined.push_back(frame);
+                                 info->inlined.push_back(frame);
                              }
                              return 0;
                          },
@@ -140,17 +148,26 @@ struct Module
 
         // no debug information available? try to fallback on the symbol table information
         if (!info.frame.isValid()) {
+            struct Data
+            {
+                AddressInformation* info;
+                const Module* module;
+                uintptr_t address;
+            };
+            Data data = {&info, this, address};
             backtrace_syminfo(
                 backtraceState, address,
                 [](void* data, uintptr_t /*pc*/, const char* symname, uintptr_t /*symval*/, uintptr_t /*symsize*/) {
                     if (symname) {
-                        reinterpret_cast<AddressInformation*>(data)->frame.function = demangle(symname);
+                        reinterpret_cast<Data*>(data)->info->frame.function = demangle(symname);
                     }
                 },
-                [](void* /*data*/, const char* msg, int errnum) {
-                    cerr << "Module backtrace error (code " << errnum << "): " << msg << endl;
+                [](void* _data, const char* msg, int errnum) {
+                    auto* data = reinterpret_cast<const Data*>(_data);
+                    error_out << "Module backtrace error for address " << hex << data->address << dec << " in module "
+                              << data->module->fileName << " (code " << errnum << "): " << msg << endl;
                 },
-                &info);
+                &data);
         }
 
         return info;
@@ -168,6 +185,7 @@ struct Module
             != tie(module.addressStart, module.addressEnd, module.moduleIndex);
     }
 
+    string fileName;
     uintptr_t addressStart;
     uintptr_t addressEnd;
     size_t moduleIndex;
@@ -177,6 +195,7 @@ struct Module
 struct AccumulatedTraceData
 {
     AccumulatedTraceData()
+        : out(fileno(stdout))
     {
         m_modules.reserve(256);
         m_backtraceStates.reserve(64);
@@ -186,7 +205,8 @@ struct AccumulatedTraceData
 
     ~AccumulatedTraceData()
     {
-        fprintf(stdout, "# strings: %zu\n# ips: %zu\n", m_internedData.size(), m_encounteredIps.size());
+        out.write("# strings: %zu\n# ips: %zu\n", m_internedData.size(), m_encounteredIps.size());
+        out.flush();
     }
 
     ResolvedIP resolve(const uintptr_t ip)
@@ -219,8 +239,7 @@ struct AccumulatedTraceData
             m_modulesDirty = false;
         }
 
-        auto resolveFrame = [this](const Frame& frame)
-        {
+        auto resolveFrame = [this](const Frame& frame) {
             return ResolvedFrame{intern(frame.function), intern(frame.file), frame.line};
         };
 
@@ -233,13 +252,12 @@ struct AccumulatedTraceData
             data.moduleIndex = module->moduleIndex;
             const auto info = module->resolveAddress(ip);
             data.frame = resolveFrame(info.frame);
-            std::transform(info.inlined.begin(), info.inlined.end(), std::back_inserter(data.inlined),
-                           resolveFrame);
+            std::transform(info.inlined.begin(), info.inlined.end(), std::back_inserter(data.inlined), resolveFrame);
         }
         return data;
     }
 
-    size_t intern(const string& str, std::string* internedString = nullptr)
+    size_t intern(const string& str, const char** internedString = nullptr)
     {
         if (str.empty()) {
             return 0;
@@ -248,23 +266,23 @@ struct AccumulatedTraceData
         auto it = m_internedData.find(str);
         if (it != m_internedData.end()) {
             if (internedString) {
-                *internedString = it->first;
+                *internedString = it->first.data();
             }
             return it->second;
         }
         const size_t id = m_internedData.size() + 1;
         it = m_internedData.insert(it, make_pair(str, id));
         if (internedString) {
-            *internedString = it->first;
+            *internedString = it->first.data();
         }
-        fprintf(stdout, "s %s\n", str.c_str());
+        out.write("s %s\n", str.c_str());
         return id;
     }
 
-    void addModule(backtrace_state* backtraceState, const size_t moduleIndex, const uintptr_t addressStart,
-                   const uintptr_t addressEnd)
+    void addModule(string fileName, backtrace_state* backtraceState, const size_t moduleIndex,
+                   const uintptr_t addressStart, const uintptr_t addressEnd)
     {
-        m_modules.emplace_back(addressStart, addressEnd, backtraceState, moduleIndex);
+        m_modules.emplace_back(fileName, addressStart, addressEnd, backtraceState, moduleIndex);
         m_modulesDirty = true;
     }
 
@@ -290,17 +308,17 @@ struct AccumulatedTraceData
         m_encounteredIps.insert(it, make_pair(instructionPointer, ipId));
 
         const auto ip = resolve(instructionPointer);
-        fprintf(stdout, "i %zx %zx", instructionPointer, ip.moduleIndex);
+        out.write("i %zx %zx", instructionPointer, ip.moduleIndex);
         if (ip.frame.functionIndex || ip.frame.fileIndex) {
-            fprintf(stdout, " %zx", ip.frame.functionIndex);
+            out.write(" %zx", ip.frame.functionIndex);
             if (ip.frame.fileIndex) {
-                fprintf(stdout, " %zx %x", ip.frame.fileIndex, ip.frame.line);
+                out.write(" %zx %x", ip.frame.fileIndex, ip.frame.line);
                 for (const auto& inlined : ip.inlined) {
-                    fprintf(stdout, " %zx %zx %x", inlined.functionIndex, inlined.fileIndex, inlined.line);
+                    out.write(" %zx %zx %x", inlined.functionIndex, inlined.fileIndex, inlined.line);
                 }
             }
         }
-        fputc('\n', stdout);
+        out.write("\n");
         return ipId;
     }
 
@@ -308,7 +326,7 @@ struct AccumulatedTraceData
      * Prevent the same file from being initialized multiple times.
      * This drastically cuts the memory consumption down
      */
-    backtrace_state* findBacktraceState(const std::string& fileName, uintptr_t addressStart)
+    backtrace_state* findBacktraceState(const char* fileName, uintptr_t addressStart)
     {
         if (boost::algorithm::starts_with(fileName, "linux-vdso.so")) {
             // prevent warning, since this will always fail
@@ -324,12 +342,12 @@ struct AccumulatedTraceData
         {
             const char* fileName;
         };
-        CallbackData data = {fileName.c_str()};
+        CallbackData data = {fileName};
 
         auto errorHandler = [](void* rawData, const char* msg, int errnum) {
             auto data = reinterpret_cast<const CallbackData*>(rawData);
-            cerr << "Failed to create backtrace state for module " << data->fileName << ": " << msg << " / "
-                 << strerror(errnum) << " (error code " << errnum << ")" << endl;
+            error_out << "Failed to create backtrace state for module " << data->fileName << ": " << msg << " / "
+                      << strerror(errnum) << " (error code " << errnum << ")" << endl;
         };
 
         auto state = backtrace_create_state(data.fileName, /* we are single threaded, so: not thread safe */ false,
@@ -340,8 +358,8 @@ struct AccumulatedTraceData
             if (descriptor >= 1) {
                 int foundSym = 0;
                 int foundDwarf = 0;
-                auto ret = elf_add(state, data.fileName, descriptor, addressStart, errorHandler, &data, &state->fileline_fn, &foundSym,
-                                   &foundDwarf, false, false);
+                auto ret = elf_add(state, data.fileName, descriptor, addressStart, errorHandler, &data,
+                                   &state->fileline_fn, &foundSym, &foundDwarf, false, false);
                 if (ret && foundSym) {
                     state->syminfo_fn = &elf_syminfo;
                 } else {
@@ -355,6 +373,8 @@ struct AccumulatedTraceData
         return state;
     }
 
+    LineWriter out;
+
 private:
     vector<Module> m_modules;
     unordered_map<std::string, backtrace_state*> m_backtraceStates;
@@ -363,6 +383,24 @@ private:
     unordered_map<string, size_t> m_internedData;
     unordered_map<uintptr_t, size_t> m_encounteredIps;
 };
+
+struct Stats
+{
+    uint64_t allocations = 0;
+    uint64_t leakedAllocations = 0;
+    uint64_t temporaryAllocations = 0;
+} c_stats;
+
+void exitHandler()
+{
+    fflush(stdout);
+    fprintf(stderr,
+            "heaptrack stats:\n"
+            "\tallocations:          \t%" PRIu64 "\n"
+            "\tleaked allocations:   \t%" PRIu64 "\n"
+            "\ttemporary allocations:\t%" PRIu64 "\n",
+            c_stats.allocations, c_stats.leakedAllocations, c_stats.temporaryAllocations);
+}
 }
 
 int main(int /*argc*/, char** /*argv*/)
@@ -371,6 +409,9 @@ int main(int /*argc*/, char** /*argv*/)
     ios_base::sync_with_stdio(false);
     __fsetlocking(stdout, FSETLOCKING_BYCALLER);
     __fsetlocking(stdin, FSETLOCKING_BYCALLER);
+
+    // output data at end, even when we get terminated
+    std::atexit(exitHandler);
 
     AccumulatedTraceData data;
 
@@ -382,12 +423,12 @@ int main(int /*argc*/, char** /*argv*/)
     uint64_t lastPtr = 0;
     AllocationInfoSet allocationInfos;
 
-    uint64_t allocations = 0;
-    uint64_t leakedAllocations = 0;
-    uint64_t temporaryAllocations = 0;
-
     while (reader.getLine(cin)) {
         if (reader.mode() == 'x') {
+            if (!exe.empty()) {
+                error_out << "received duplicate exe event - child process tracking is not yet supported" << endl;
+                return 1;
+            }
             reader >> exe;
         } else if (reader.mode() == 'm') {
             string fileName;
@@ -398,53 +439,53 @@ int main(int /*argc*/, char** /*argv*/)
                 if (fileName == "x") {
                     fileName = exe;
                 }
-                std::string internedString;
+                const char* internedString = nullptr;
                 const auto moduleIndex = data.intern(fileName, &internedString);
                 uintptr_t addressStart = 0;
                 if (!(reader >> addressStart)) {
-                    cerr << "failed to parse line: " << reader.line() << endl;
+                    error_out << "failed to parse line: " << reader.line() << endl;
                     return 1;
                 }
                 auto state = data.findBacktraceState(internedString, addressStart);
                 uintptr_t vAddr = 0;
                 uintptr_t memSize = 0;
                 while ((reader >> vAddr) && (reader >> memSize)) {
-                    data.addModule(state, moduleIndex, addressStart + vAddr, addressStart + vAddr + memSize);
+                    data.addModule(fileName, state, moduleIndex, addressStart + vAddr, addressStart + vAddr + memSize);
                 }
             }
         } else if (reader.mode() == 't') {
             uintptr_t instructionPointer = 0;
             size_t parentIndex = 0;
             if (!(reader >> instructionPointer) || !(reader >> parentIndex)) {
-                cerr << "failed to parse line: " << reader.line() << endl;
+                error_out << "failed to parse line: " << reader.line() << endl;
                 return 1;
             }
             // ensure ip is encountered
             const auto ipId = data.addIp(instructionPointer);
             // trace point, map current output index to parent index
-            fprintf(stdout, "t %zx %zx\n", ipId, parentIndex);
+            data.out.writeHexLine('t', ipId, parentIndex);
         } else if (reader.mode() == '+') {
-            ++allocations;
-            ++leakedAllocations;
+            ++c_stats.allocations;
+            ++c_stats.leakedAllocations;
             uint64_t size = 0;
             TraceIndex traceId;
             uint64_t ptr = 0;
             if (!(reader >> size) || !(reader >> traceId.index) || !(reader >> ptr)) {
-                cerr << "failed to parse line: " << reader.line() << endl;
+                error_out << "failed to parse line: " << reader.line() << endl;
                 continue;
             }
 
-            AllocationIndex index;
+            AllocationInfoIndex index;
             if (allocationInfos.add(size, traceId, &index)) {
-                fprintf(stdout, "a %" PRIx64 " %x\n", size, traceId.index);
+                data.out.writeHexLine('a', size, traceId.index);
             }
             ptrToIndex.addPointer(ptr, index);
             lastPtr = ptr;
-            fprintf(stdout, "+ %x\n", index.index);
+            data.out.writeHexLine('+', index.index);
         } else if (reader.mode() == '-') {
             uint64_t ptr = 0;
             if (!(reader >> ptr)) {
-                cerr << "failed to parse line: " << reader.line() << endl;
+                error_out << "failed to parse line: " << reader.line() << endl;
                 continue;
             }
             bool temporary = lastPtr == ptr;
@@ -453,22 +494,15 @@ int main(int /*argc*/, char** /*argv*/)
             if (!allocation.second) {
                 continue;
             }
-            fprintf(stdout, "- %x\n", allocation.first.index);
+            data.out.writeHexLine('-', allocation.first.index);
             if (temporary) {
-                ++temporaryAllocations;
+                ++c_stats.temporaryAllocations;
             }
-            --leakedAllocations;
+            --c_stats.leakedAllocations;
         } else {
-            fputs(reader.line().c_str(), stdout);
-            fputc('\n', stdout);
+            data.out.write("%s\n", reader.line().c_str());
         }
     }
-
-    fprintf(stderr, "heaptrack stats:\n"
-                    "\tallocations:          \t%" PRIu64 "\n"
-                    "\tleaked allocations:   \t%" PRIu64 "\n"
-                    "\ttemporary allocations:\t%" PRIu64 "\n",
-            allocations, leakedAllocations, temporaryAllocations);
 
     return 0;
 }

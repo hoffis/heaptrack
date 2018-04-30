@@ -1,5 +1,5 @@
 /*
- * Copyright 2014-2017 Milian Wolff <mail@milianw.de>
+ * Copyright 2018 Milian Wolff <mail@milianw.de>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -16,33 +16,43 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
-void foo()
-{
-    new char[1];
-}
+#ifndef TEMPFILE_H
+#define TEMPFILE_H
 
-void bar()
-{
-    foo();
-    new char[2];
-}
+#include <boost/filesystem.hpp>
+#include <fcntl.h>
+#include <unistd.h>
 
-void asdf()
+struct TempFile
 {
-    bar();
-    new char[3];
-}
+    TempFile()
+        : path(boost::filesystem::unique_path())
+        , fileName(path.native())
+    {
+    }
 
-void foobar()
-{
-    asdf();
-    new char[5];
-}
+    ~TempFile()
+    {
+        boost::filesystem::remove(path);
+        close();
+    }
 
-int main()
-{
-    asdf();
-    new char[4];
-    foobar();
-    return 0;
-}
+    bool open()
+    {
+        fd = ::open(fileName.c_str(), O_CREAT | O_CLOEXEC | O_RDWR, 0644);
+        return fd != -1;
+    }
+
+    void close()
+    {
+        if (fd != -1) {
+            ::close(fd);
+        }
+    }
+
+    const boost::filesystem::path path;
+    const std::string fileName;
+    int fd = -1;
+};
+
+#endif

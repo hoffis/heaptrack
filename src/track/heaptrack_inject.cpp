@@ -18,12 +18,15 @@
 
 #include "libheaptrack.h"
 #include "util/config.h"
+#include "util/linewriter.h"
 
 #include <cstdlib>
 #include <cstring>
 
+#include <errno.h>
 #include <link.h>
 #include <malloc.h>
+#include <unistd.h>
 
 #include <sys/mman.h>
 
@@ -262,8 +265,7 @@ void try_overwrite_symbols(const Elf::Dyn* dyn, const Elf::Addr base, const bool
 
     // initialize the elf tables
     for (; dyn->d_tag != DT_NULL; ++dyn) {
-        symbols.consume(dyn) || strings.consume(dyn)
-            || rels.consume(dyn) || relas.consume(dyn) || jmprels.consume(dyn);
+        symbols.consume(dyn) || strings.consume(dyn) || rels.consume(dyn) || relas.consume(dyn) || jmprels.consume(dyn);
     }
 
     // find symbols to overwrite
@@ -300,7 +302,7 @@ void overwrite_symbols() noexcept
 extern "C" {
 void heaptrack_inject(const char* outputFileName) noexcept
 {
-    heaptrack_init(outputFileName, "", []() { overwrite_symbols(); }, [](FILE* out) { fprintf(out, "A\n"); },
+    heaptrack_init(outputFileName, "", []() { overwrite_symbols(); }, [](LineWriter& out) { out.write("A\n"); },
                    []() {
                        bool do_shutdown = true;
                        dl_iterate_phdr(&iterate_phdrs, &do_shutdown);

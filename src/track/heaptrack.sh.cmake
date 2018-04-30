@@ -66,11 +66,25 @@ pid=
 client=
 
 # path to current heaptrack.sh executable
-EXE_PATH=$(readlink -f $(dirname $(readlink -f $0)))
+SCRIPT_PATH=$(readlink -f "$0")
+SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
+EXE_PATH=$(readlink -f "$SCRIPT_DIR")
+
+openHeaptrackDataFiles() {
+    if [ -x "$EXE_PATH/heaptrack_gui" ]; then
+        "$EXE_PATH/heaptrack_gui" "$@"
+    else
+        "$EXE_PATH/heaptrack_print" "$@"
+    fi
+}
 
 while true; do
     case "$1" in
         "-d" | "--debug")
+            if [ -z "$(which gdb 2> /dev/null)" ]; then
+                echo "GDB is not installed, cannot debug heaptrack."
+                exit 1
+            fi
             debug=1
             shift 1
             ;;
@@ -79,6 +93,10 @@ while true; do
             exit 0
             ;;
         "-p" | "--pid")
+            if [ -z "$(which gdb 2> /dev/null)" ]; then
+                echo "GDB is not installed, cannot attach to running process."
+                exit 1
+            fi
             pid=$2
             if [ -z "$pid" ]; then
                 echo "Missing PID argument."
@@ -103,19 +121,18 @@ while true; do
             ;;
         "-a" | "--analyze")
             shift 1
-            if [ -x "$EXE_PATH/heaptrack_gui" ]; then
-                $EXE_PATH/heaptrack_gui $@
-                exit
-            else
-                $EXE_PATH/heaptrack_print $@
-                exit
-            fi
+            openHeaptrackDataFiles "$@"
+            exit
             ;;
         *)
             if [ "$1" = "--" ]; then
                 shift 1
             fi
             if [ ! -x "$(which "$1" 2> /dev/null)" ]; then
+                if [ -f "$1" ] && echo "$1" | grep -q "heaptrack."; then
+                    openHeaptrackDataFiles "$@"
+                    exit
+                fi
                 echo "Error: Debuggee \"$1\" is not an executable."
                 echo
                 echo "Usage: $0 [--debug|-d] [--help|-h] DEBUGGEE [ARGS...]"
@@ -160,9 +177,17 @@ LIBHEAPTRACK_INJECT=$(readlink -f "$LIBHEAPTRACK_INJECT")
 pipe=/tmp/heaptrack_fifo$$
 mkfifo $pipe
 
+output_suffix="gz"
+COMPRESSOR="gzip -c"
+
+if [ "@ZSTD_FOUND@" = "TRUE" ] && [ ! -z "$(which zstd)" ]; then
+    output_suffix="zst"
+    COMPRESSOR="zstd -c"
+fi
+
 # interpret the data and compress the output on the fly
-output="$output.gz"
-"$INTERPRETER" < $pipe | gzip -c > "$output" &
+output="$output.$output_suffix"
+"$INTERPRETER" < $pipe | $COMPRESSOR > "$output" &
 debuggee=$!
 
 cleanup() {
@@ -188,12 +213,13 @@ echo "heaptrack output will be written to \"$output\""
 
 if [ -z "$debug" ] && [ -z "$pid" ]; then
   echo "starting application, this might take some time..."
-  LD_PRELOAD=$LIBHEAPTRACK_PRELOAD${LD_PRELOAD:+:$LD_PRELOAD} DUMP_HEAPTRACK_OUTPUT="$pipe" "$client" "$@"
+  LD_PRELOAD="$LIBHEAPTRACK_PRELOAD${LD_PRELOAD:+:$LD_PRELOAD}" DUMP_HEAPTRACK_OUTPUT="$pipe" "$client" "$@"
 else
   if [ -z "$pid" ]; then
     echo "starting application in GDB, this might take some time..."
-    gdb --eval-command="set environment LD_PRELOAD=$LIBHEAPTRACK_PRELOAD" \
+    gdb --quiet --eval-command="set environment LD_PRELOAD=$LIBHEAPTRACK_PRELOAD" \
         --eval-command="set environment DUMP_HEAPTRACK_OUTPUT=$pipe" \
+        --eval-command="set startup-with-shell off" \
         --eval-command="run" --args "$client" "$@"
   else
     echo "injecting heaptrack into application via GDB, this might take some time..."
@@ -205,7 +231,7 @@ else
             --eval-command="call (void) heaptrack_inject(\"$pipe\")" \
             --eval-command="detach"
     else
-        gdb -p $pid \
+        gdb --quiet -p $pid \
             --eval-command="sharedlibrary libc.so" \
             --eval-command="call (void) __libc_dlopen_mode(\"$LIBHEAPTRACK_INJECT\", 0x80000000 | 0x002)" \
             --eval-command="sharedlibrary libheaptrack_inject" \

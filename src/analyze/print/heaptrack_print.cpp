@@ -85,6 +85,34 @@ ostream& operator<<(ostream& out, const formatBytes data)
     return out << fixed << setprecision(2) << bytes << *unit;
 }
 
+enum CostType
+{
+    Allocations,
+    Temporary,
+    Allocated,
+    Leaked,
+    Peak
+};
+
+std::istream& operator>>(std::istream& in, CostType& type)
+{
+    std::string token;
+    in >> token;
+    if (token == "allocations")
+        type = Allocations;
+    else if (token == "temporary")
+        type = Temporary;
+    else if (token == "allocated")
+        type = Allocated;
+    else if (token == "leaked")
+        type = Leaked;
+    else if (token == "peak")
+        type = Peak;
+    else
+        in.setstate(std::ios_base::failbit);
+    return in;
+}
+
 struct Printer final : public AccumulatedTraceData
 {
     void finalize()
@@ -156,7 +184,8 @@ struct Printer final : public AccumulatedTraceData
                                                 break;
                                             }
                                             auto matchFunction = [this](const Frame& frame) {
-                                                return stringify(frame.functionIndex).find(filterBtFunction) != string::npos;
+                                                return stringify(frame.functionIndex).find(filterBtFunction)
+                                                    != string::npos;
                                             };
                                             if (matchFunction(ip.frame)) {
                                                 return false;
@@ -249,6 +278,8 @@ struct Printer final : public AccumulatedTraceData
 
     void printBacktrace(TraceNode node, ostream& out, const size_t indent = 0, bool skipFirst = false) const
     {
+        unordered_set<uint32_t> recursionGuard;
+        recursionGuard.insert(node.ipIndex.index);
         while (node.ipIndex) {
             const auto& ip = findIp(node.ipIndex);
             if (!skipFirst) {
@@ -257,6 +288,11 @@ struct Printer final : public AccumulatedTraceData
             skipFirst = false;
 
             if (isStopIndex(ip.frame.functionIndex)) {
+                break;
+            }
+
+            if (!recursionGuard.insert(node.parentIndex.index).second) {
+                cerr << "Trace recursion detected - corrupt data file?" << endl;
                 break;
             }
 
@@ -468,7 +504,7 @@ struct Printer final : public AccumulatedTraceData
         }
     }
 
-    void handleAllocation(const AllocationInfo& info, const AllocationIndex /*index*/) override
+    void handleAllocation(const AllocationInfo& info, const AllocationInfoIndex /*index*/) override
     {
         if (printHistogram) {
             ++sizeHistogram[info.size];
@@ -518,52 +554,61 @@ struct Printer final : public AccumulatedTraceData
 int main(int argc, char** argv)
 {
     po::options_description desc("Options", 120, 60);
-    desc.add_options()("file,f", po::value<string>(), "The heaptrack data file to print.")(
-        "diff,d", po::value<string>()->default_value({}), "Find the differences to this file.")(
-        "shorten-templates,t", po::value<bool>()->default_value(true)->implicit_value(true),
-        "Shorten template identifiers.")("merge-backtraces,m",
-                                         po::value<bool>()->default_value(true)->implicit_value(true),
-                                         "Merge backtraces.\nNOTE: the merged peak consumption is not correct.")(
-        "print-peaks,p", po::value<bool>()->default_value(true)->implicit_value(true),
-        "Print backtraces to top allocators, sorted by peak consumption.")(
-        "print-allocators,a", po::value<bool>()->default_value(true)->implicit_value(true),
-        "Print backtraces to top allocators, sorted by number of calls to "
-        "allocation functions.")("print-temporary,T", po::value<bool>()->default_value(true)->implicit_value(true),
-                                 "Print backtraces to top allocators, sorted by number of temporary "
-                                 "allocations.")("print-leaks,l",
-                                                 po::value<bool>()->default_value(false)->implicit_value(true),
-                                                 "Print backtraces to leaked memory allocations.")(
-        "print-overall-allocated,o", po::value<bool>()->default_value(false)->implicit_value(true),
-        "Print top overall allocators, ignoring memory frees.")(
-        "peak-limit,n", po::value<size_t>()->default_value(10)->implicit_value(10),
-        "Limit the number of reported peaks.")("sub-peak-limit,s",
-                                               po::value<size_t>()->default_value(5)->implicit_value(5),
-                                               "Limit the number of reported backtraces of merged peak locations.")(
-        "print-histogram,H", po::value<string>()->default_value(string()),
-        "Path to output file where an allocation size histogram will be written "
-        "to.")("print-flamegraph,F", po::value<string>()->default_value(string()),
-               "Path to output file where a flame-graph compatible stack file will be "
-               "written to.\n"
-               "To visualize the resulting file, use flamegraph.pl from "
-               "https://github.com/brendangregg/FlameGraph:\n"
-               "  heaptrack_print heaptrack.someapp.PID.gz -F stacks.txt\n"
-               "  # optionally pass --reverse to flamegraph.pl\n"
-               "  flamegraph.pl --title \"heaptrack: allocations\" --colors mem \\\n"
-               "    --countname allocations < stacks.txt > heaptrack.someapp.PID.svg\n"
-               "  [firefox|chromium] heaptrack.someapp.PID.svg\n")(
-        "print-massif,M", po::value<string>()->default_value(string()),
-        "Path to output file where a massif compatible data file will be written "
-        "to.")("massif-threshold", po::value<double>()->default_value(1.),
-               "Percentage of current memory usage, below which allocations are "
-               "aggregated into a 'below threshold' entry.\n"
-               "This is only used in the massif output file so far.\n")(
-        "massif-detailed-freq", po::value<size_t>()->default_value(2),
-        "Frequency of detailed snapshots in the massif output file. Increase "
-        "this to reduce the file size.\n"
-        "You can set the value to zero to disable detailed snapshots.\n")(
-        "filter-bt-function", po::value<string>()->default_value(string()),
-        "Only print allocations where the backtrace contains the given "
-        "function.")("help,h", "Show this help message.")("version,v", "Displays version information.");
+    // clang-format off
+    desc.add_options()
+        ("file,f", po::value<string>(),
+            "The heaptrack data file to print.")
+        ("diff,d", po::value<string>()->default_value({}),
+            "Find the differences to this file.")
+        ("shorten-templates,t", po::value<bool>()->default_value(true)->implicit_value(true),
+            "Shorten template identifiers.")
+        ("merge-backtraces,m", po::value<bool>()->default_value(true)->implicit_value(true),
+            "Merge backtraces.\nNOTE: the merged peak consumption is not correct.")
+        ("print-peaks,p", po::value<bool>()->default_value(true)->implicit_value(true),
+            "Print backtraces to top allocators, sorted by peak consumption.")
+        ("print-allocators,a", po::value<bool>()->default_value(true)->implicit_value(true),
+            "Print backtraces to top allocators, sorted by number of calls to allocation functions.")
+        ("print-temporary,T", po::value<bool>()->default_value(true)->implicit_value(true),
+            "Print backtraces to top allocators, sorted by number of temporary allocations.")
+        ("print-leaks,l", po::value<bool>()->default_value(false)->implicit_value(true),
+            "Print backtraces to leaked memory allocations.")
+        ("print-overall-allocated,o", po::value<bool>()->default_value(false)->implicit_value(true),
+            "Print top overall allocators, ignoring memory frees.")
+        ("peak-limit,n", po::value<size_t>()->default_value(10)->implicit_value(10),
+            "Limit the number of reported peaks.")
+        ("sub-peak-limit,s", po::value<size_t>()->default_value(5)->implicit_value(5),
+            "Limit the number of reported backtraces of merged peak locations.")
+        ("print-histogram,H", po::value<string>()->default_value(string()),
+            "Path to output file where an allocation size histogram will be written to.")
+        ("flamegraph-cost-type", po::value<CostType>()->default_value(Allocations),
+            "The cost type to use when generating a flamegraph. Possible options are:\n"
+            "  - allocations: number of allocations\n"
+            "  - temporary: number of temporary allocations\n"
+            "  - allocated: bytes allocated, ignoring deallocations\n"
+            "  - leaked: bytes not deallocated at the end\n"
+            "  - peak: bytes consumed at highest total memory consumption")
+        ("print-flamegraph,F", po::value<string>()->default_value(string()),
+            "Path to output file where a flame-graph compatible stack file will be written to.\n"
+            "To visualize the resulting file, use flamegraph.pl from "
+            "https://github.com/brendangregg/FlameGraph:\n"
+            "  heaptrack_print heaptrack.someapp.PID.gz -F stacks.txt\n"
+            "  # optionally pass --reverse to flamegraph.pl\n"
+            "  flamegraph.pl --title \"heaptrack: allocations\" --colors mem \\\n"
+            "    --countname allocations < stacks.txt > heaptrack.someapp.PID.svg\n"
+            "  [firefox|chromium] heaptrack.someapp.PID.svg\n")
+        ("print-massif,M", po::value<string>()->default_value(string()),
+            "Path to output file where a massif compatible data file will be written to.")
+        ("massif-threshold", po::value<double>()->default_value(1.),
+            "Percentage of current memory usage, below which allocations are aggregated into a 'below threshold' entry.\n"
+            "This is only used in the massif output file so far.\n")
+        ("massif-detailed-freq", po::value<size_t>()->default_value(2),
+            "Frequency of detailed snapshots in the massif output file. Increase  this to reduce the file size.\n"
+            "You can set the value to zero to disable detailed snapshots.\n")
+        ("filter-bt-function", po::value<string>()->default_value(string()),
+            "Only print allocations where the backtrace contains the given function.")
+        ("help,h", "Show this help message.")
+        ("version,v", "Displays version information.");
+    // clang-format on
     po::positional_options_description p;
     p.add("file", -1);
 
@@ -610,6 +655,7 @@ int main(int argc, char** argv)
     const string printHistogram = vm["print-histogram"].as<string>();
     data.printHistogram = !printHistogram.empty();
     const string printFlamegraph = vm["print-flamegraph"].as<string>();
+    const auto flamegraphCostType = vm["flamegraph-cost-type"].as<CostType>();
     const string printMassif = vm["print-massif"].as<string>();
     if (!printMassif.empty()) {
         data.massifOut.open(printMassif, ios_base::out);
@@ -755,7 +801,25 @@ int main(int argc, char** argv)
                 } else {
                     data.printFlamegraph(data.findTrace(allocation.traceIndex), flamegraph);
                 }
-                flamegraph << ' ' << allocation.allocations << '\n';
+                flamegraph << ' ';
+                switch (flamegraphCostType) {
+                case Allocations:
+                    flamegraph << allocation.allocations;
+                    break;
+                case Allocated:
+                    flamegraph << allocation.allocated;
+                    break;
+                case Temporary:
+                    flamegraph << allocation.temporary;
+                    break;
+                case Peak:
+                    flamegraph << allocation.peak;
+                    break;
+                case Leaked:
+                    flamegraph << allocation.leaked;
+                    break;
+                }
+                flamegraph << '\n';
             }
         }
     }

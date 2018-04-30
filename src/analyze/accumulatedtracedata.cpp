@@ -23,6 +23,7 @@
 #include <iostream>
 #include <memory>
 
+#include <boost-zstd/zstd.hpp>
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/iostreams/filter/gzip.hpp>
 #include <boost/iostreams/filtering_stream.hpp>
@@ -30,6 +31,8 @@
 #include "util/config.h"
 #include "util/linereader.h"
 #include "util/pointermap.h"
+
+#include "analyze_config.h"
 
 #ifdef __GNUC__
 #define POTENTIALLY_UNUSED __attribute__((unused))
@@ -61,6 +64,7 @@ AccumulatedTraceData::AccumulatedTraceData()
     traces.reserve(65536);
     strings.reserve(4096);
     allocations.reserve(16384);
+    traceIndexToAllocationIndex.reserve(16384);
     stopIndices.reserve(4);
     opNewIpIndices.reserve(16);
 }
@@ -128,7 +132,9 @@ bool AccumulatedTraceData::read(const string& inputFile)
 
 bool AccumulatedTraceData::read(const string& inputFile, const ParsePass pass)
 {
-    const bool isCompressed = boost::algorithm::ends_with(inputFile, ".gz");
+    const bool isGzCompressed = boost::algorithm::ends_with(inputFile, ".gz");
+    const bool isZstdCompressed = boost::algorithm::ends_with(inputFile, ".zst");
+    const bool isCompressed = isGzCompressed || isZstdCompressed;
     ifstream file(inputFile, isCompressed ? ios_base::in | ios_base::binary : ios_base::in);
 
     if (!file.is_open()) {
@@ -137,8 +143,15 @@ bool AccumulatedTraceData::read(const string& inputFile, const ParsePass pass)
     }
 
     boost::iostreams::filtering_istream in;
-    if (isCompressed) {
+    if (isGzCompressed) {
         in.push(boost::iostreams::gzip_decompressor());
+    } else if (isZstdCompressed) {
+#if ZSTD_FOUND
+        in.push(boost::iostreams::zstd_decompressor());
+#else
+        cerr << "Heaptrack was built without zstd support, cannot decompressed data file: " << inputFile << endl;
+        return false;
+#endif
     }
     in.push(file);
 
@@ -152,9 +165,11 @@ bool AccumulatedTraceData::read(istream& in, const ParsePass pass)
 
     vector<string> opNewStrings = {
         // 64 bit
-        "operator new(unsigned long)", "operator new[](unsigned long)",
+        "operator new(unsigned long)",
+        "operator new[](unsigned long)",
         // 32 bit
-        "operator new(unsigned int)", "operator new[](unsigned int)",
+        "operator new(unsigned int)",
+        "operator new[](unsigned int)",
     };
     vector<StringIndex> opNewStrIndices;
     opNewStrIndices.reserve(opNewStrings.size());
@@ -164,13 +179,15 @@ bool AccumulatedTraceData::read(istream& in, const ParsePass pass)
     const auto lastPeakCost = pass != FirstPass ? totalCost.peak : 0;
     const auto lastPeakTime = pass != FirstPass ? peakTime : 0;
 
-    m_maxAllocationTraceIndex.index = 0;
     totalCost = {};
     peakTime = 0;
     systemInfo = {};
     peakRSS = 0;
-    allocations.clear();
+    for (auto& allocation : allocations) {
+        allocation.clearCost();
+    }
     uint fileVersion = 0;
+    bool debuggeeEncountered = false;
 
     // required for backwards compatibility
     // newer versions handle this in heaptrack_interpret already
@@ -221,9 +238,7 @@ bool AccumulatedTraceData::read(istream& in, const ParsePass pass)
             reader >> ip.instructionPointer;
             reader >> ip.moduleIndex;
             auto readFrame = [&reader](Frame* frame) {
-                return (reader >> frame->functionIndex)
-                    && (reader >> frame->fileIndex)
-                    && (reader >> frame->line);
+                return (reader >> frame->functionIndex) && (reader >> frame->fileIndex) && (reader >> frame->line);
             };
             if (readFrame(&ip.frame)) {
                 Frame inlinedFrame;
@@ -240,13 +255,13 @@ bool AccumulatedTraceData::read(istream& in, const ParsePass pass)
             }
         } else if (reader.mode() == '+') {
             AllocationInfo info;
-            AllocationIndex allocationIndex;
+            AllocationInfoIndex allocationIndex;
             if (fileVersion >= 1) {
-                if (!(reader >> allocationIndex.index)) {
+                if (!(reader >> allocationIndex)) {
                     cerr << "failed to parse line: " << reader.line() << endl;
                     continue;
                 } else if (allocationIndex.index >= allocationInfos.size()) {
-                    cerr << "allocation index out of bounds: " << allocationIndex.index
+                    cerr << "allocation index out of bounds: " << allocationIndex
                          << ", maximum is: " << allocationInfos.size() << endl;
                     continue;
                 }
@@ -254,11 +269,13 @@ bool AccumulatedTraceData::read(istream& in, const ParsePass pass)
                 lastAllocationPtr = allocationIndex.index;
             } else { // backwards compatibility
                 uint64_t ptr = 0;
-                if (!(reader >> info.size) || !(reader >> info.traceIndex) || !(reader >> ptr)) {
+                TraceIndex traceIndex;
+                if (!(reader >> info.size) || !(reader >> traceIndex) || !(reader >> ptr)) {
                     cerr << "failed to parse line: " << reader.line() << endl;
                     continue;
                 }
-                if (allocationInfoSet.add(info.size, info.traceIndex, &allocationIndex)) {
+                info.allocationIndex = mapToAllocationIndex(traceIndex);
+                if (allocationInfoSet.add(info.size, traceIndex, &allocationIndex)) {
                     allocationInfos.push_back(info);
                 }
                 pointers.addPointer(ptr, allocationIndex);
@@ -266,7 +283,7 @@ bool AccumulatedTraceData::read(istream& in, const ParsePass pass)
             }
 
             if (pass != FirstPass) {
-                auto& allocation = findAllocation(info.traceIndex);
+                auto& allocation = allocations[info.allocationIndex.index];
                 allocation.leaked += info.size;
                 allocation.allocated += info.size;
                 ++allocation.allocations;
@@ -288,10 +305,10 @@ bool AccumulatedTraceData::read(istream& in, const ParsePass pass)
                 }
             }
         } else if (reader.mode() == '-') {
-            AllocationIndex allocationInfoIndex;
+            AllocationInfoIndex allocationInfoIndex;
             bool temporary = false;
             if (fileVersion >= 1) {
-                if (!(reader >> allocationInfoIndex.index)) {
+                if (!(reader >> allocationInfoIndex)) {
                     cerr << "failed to parse line: " << reader.line() << endl;
                     continue;
                 }
@@ -319,7 +336,7 @@ bool AccumulatedTraceData::read(istream& in, const ParsePass pass)
             }
 
             if (pass != FirstPass) {
-                auto& allocation = findAllocation(info.traceIndex);
+                auto& allocation = allocations[info.allocationIndex.index];
                 allocation.leaked -= info.size;
                 if (temporary) {
                     ++allocation.temporary;
@@ -330,11 +347,14 @@ bool AccumulatedTraceData::read(istream& in, const ParsePass pass)
                 continue;
             }
             AllocationInfo info;
-            if (!(reader >> info.size) || !(reader >> info.traceIndex)) {
+            TraceIndex traceIndex;
+            if (!(reader >> info.size) || !(reader >> traceIndex)) {
                 cerr << "failed to parse line: " << reader.line() << endl;
                 continue;
             }
+            info.allocationIndex = mapToAllocationIndex(traceIndex);
             allocationInfos.push_back(info);
+
         } else if (reader.mode() == '#') {
             // comment or empty line
             continue;
@@ -355,6 +375,11 @@ bool AccumulatedTraceData::read(istream& in, const ParsePass pass)
                 peakRSS = rss;
             }
         } else if (reader.mode() == 'X') {
+            if (debuggeeEncountered) {
+                cerr << "Duplicated debuggee entry - corrupt data file?" << endl;
+                return false;
+            }
+            debuggeeEncountered = true;
             if (pass != FirstPass) {
                 handleDebuggee(reader.line().c_str() + 2);
             }
@@ -487,8 +512,8 @@ POTENTIALLY_UNUSED void printTrace(const AccumulatedTraceData& data, TraceIndex 
              << data.stringify(ip.frame.functionIndex) << " in " << data.stringify(ip.moduleIndex) << " at "
              << data.stringify(ip.frame.fileIndex) << ':' << ip.frame.line << '\n';
         for (const auto& inlined : ip.inlined) {
-            cerr << '\t' << data.stringify(inlined.functionIndex) << " at "
-                 << data.stringify(inlined.fileIndex) << ':' << inlined.line << '\n';
+            cerr << '\t' << data.stringify(inlined.functionIndex) << " at " << data.stringify(inlined.fileIndex) << ':'
+                 << inlined.line << '\n';
         }
         index = trace.parentIndex;
     } while (index);
@@ -644,31 +669,42 @@ void AccumulatedTraceData::diff(const AccumulatedTraceData& base)
                       allocations.end());
 }
 
-Allocation& AccumulatedTraceData::findAllocation(const TraceIndex traceIndex)
+AllocationIndex AccumulatedTraceData::mapToAllocationIndex(const TraceIndex traceIndex)
 {
+    AllocationIndex allocationIndex;
     if (traceIndex < m_maxAllocationTraceIndex) {
         // only need to search when the trace index is previously known
-        auto it = lower_bound(allocations.begin(), allocations.end(), traceIndex,
-                              [](const Allocation& allocation, const TraceIndex traceIndex) -> bool {
-                                  return allocation.traceIndex < traceIndex;
-                              });
-        if (it == allocations.end() || it->traceIndex != traceIndex) {
-            Allocation allocation;
-            allocation.traceIndex = traceIndex;
-            it = allocations.insert(it, allocation);
+        auto it = lower_bound(traceIndexToAllocationIndex.begin(), traceIndexToAllocationIndex.end(), traceIndex,
+                              [](const pair<TraceIndex, AllocationIndex>& indexMap,
+                                 const TraceIndex traceIndex) -> bool { return indexMap.first < traceIndex; });
+        if (it != traceIndexToAllocationIndex.end() && it->first == traceIndex) {
+            return it->second;
         }
-        return *it;
+        // new allocation
+        allocationIndex.index = allocations.size();
+        traceIndexToAllocationIndex.insert(it, make_pair(traceIndex, allocationIndex));
+        Allocation allocation;
+        allocation.traceIndex = traceIndex;
+        allocations.push_back(allocation);
     } else if (traceIndex == m_maxAllocationTraceIndex && !allocations.empty()) {
         // reuse the last allocation
         assert(allocations.back().traceIndex == traceIndex);
+        allocationIndex.index = allocations.size() - 1;
     } else {
-        // actually a new allocation
+        // new allocation
+        allocationIndex.index = allocations.size();
+        traceIndexToAllocationIndex.push_back(make_pair(traceIndex, allocationIndex));
         Allocation allocation;
         allocation.traceIndex = traceIndex;
         allocations.push_back(allocation);
         m_maxAllocationTraceIndex = traceIndex;
     }
-    return allocations.back();
+    return allocationIndex;
+}
+
+Allocation& AccumulatedTraceData::findAllocation(const TraceIndex traceIndex)
+{
+    return allocations[mapToAllocationIndex(traceIndex).index];
 }
 
 InstructionPointer AccumulatedTraceData::findIp(const IpIndex ipIndex) const

@@ -22,11 +22,13 @@ set(HEAPTRACK_FILE_FORMAT_VERSION 2)
 
 set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 
+include(FeatureSummary)
 find_package(Libunwind REQUIRED)
 find_package(Boost 1.41.0 REQUIRED COMPONENTS iostreams program_options)
 find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
-include(FeatureSummary)
+find_package(Zstd)
+set_package_properties(Zstd PROPERTIES TYPE RECOMMENDED PURPOSE "Zstandard offers better (de)compression performance compared with gzip/zlib, making heaptrack faster and datafiles smaller.")
 
 option(
   HEAPTRACK_BUILD_GUI
@@ -90,6 +92,8 @@ file(RELATIVE_PATH LIBEXEC_REL_PATH
 file(RELATIVE_PATH LIB_REL_PATH
     "${CMAKE_INSTALL_PREFIX}/${BIN_INSTALL_DIR}"
     "${CMAKE_INSTALL_PREFIX}/${LIB_INSTALL_DIR}/heaptrack")
+
+set(ECM_ENABLE_SANITIZERS "" CACHE STRING "semicolon-separated list of sanitizers to enable for code that is not injected into client applications")
 
 add_subdirectory(3rdparty)
 add_subdirectory(src)

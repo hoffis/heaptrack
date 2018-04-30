@@ -1,3 +1,7 @@
+if (ECM_FOUND)
+    include(ECMEnableSanitizers)
+endif()
+
 include_directories(
     ${Boost_INCLUDE_DIRS}
     ${PROJECT_SOURCE_DIR}/3rdparty/
