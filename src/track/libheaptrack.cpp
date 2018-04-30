@@ -41,6 +41,7 @@
 #include <string>
 #include <thread>
 #include <unordered_set>
+#include <regex>
 
 #include <boost/algorithm/string/replace.hpp>
 
@@ -114,7 +115,8 @@ bool isThisThreadEnabled(){
         } else {
             char name[32] = {0,};
             pthread_getname_np(pthread_self(), name, 32);
-            enabled = (strstr(s_thread_filter, name) != nullptr) ? 1 : 0;
+            std::regex re(s_thread_filter, std::regex::icase);
+            enabled = std::regex_search(name, re) ? 1 : 0;
         }
     }
     return enabled;
