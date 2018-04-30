@@ -309,9 +309,11 @@ public:
             return;
         }
 
-        setThreadNameFilter(threadNameFilter);
         s_data = new LockedData(out, stopCallback);
 
+	if(threadNameFilter){
+        	setThreadNameFilter(threadNameFilter);
+	}
         writeVersion();
         writeExe();
         writeCommandLine();
